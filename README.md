@@ -110,10 +110,9 @@ LiCl: 1.5796 g (1579.6 mg, 0.03726 mol)
 
 ## Release
 
-GitHub Actions は以下で動作します。
+GitHub Actions は `v*` tag push で動作します。タグ対象のコミットが `main` に含まれていることを確認してから、ビルド artifact と GitHub Release asset を作成します。
 
-- `main` push: Windows x86_64 と macOS Apple Silicon のビルド検証と artifact 作成
-- tag push (`v*`): 同じ成果物を GitHub Release に添付
+- tag push (`v*`): Windows x86_64 と macOS Apple Silicon のビルド検証、artifact 作成、GitHub Release asset 添付
 
 Release artifacts:
 

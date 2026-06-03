@@ -6,6 +6,7 @@
 
 - 目的組成と目標質量から原料の秤量値を計算
 - 小数、分数、括弧付き化学式に対応
+- O2 などのガス原料は元素収支に含めつつ、秤量対象外として表示
 - 曖昧な材料名や略称は候補化学式を提示して確認
 - LLM が提案した揮発副生成物を含めて反応式をバランス
 - 反応式は必ず表示
@@ -30,6 +31,37 @@ cargo run
 
 ```bash
 OLLAMA_BASE_URL=http://localhost:11434 OLLAMA_MODEL=qwen3.6:35b cargo run
+```
+
+CLI の終了と画面操作:
+
+- `Ctrl+C`: 終了
+- `/quit`, `/exit`: 終了
+- `/clear`: 画面クリア
+
+## Agentic Loop
+
+この CLI は、LLM が対話状態と次の質問を制御し、化学式検証と秤量計算は Rust tool が決定的に実行する agentic loop を採用しています。
+
+```mermaid
+flowchart TD
+    A[User input] --> B[Local CLI state wrapper]
+    B --> C[LLM agent]
+    C --> D{Need validation or calculation?}
+    D -->|validate formula| E[validate_formula tool]
+    D -->|calculate weighing| F[calculate_weighing tool]
+    D -->|ask next question| G[Streaming response]
+    E --> H[Tool result]
+    F --> H
+    H --> C
+    C --> I{Calculation complete?}
+    I -->|No| G
+    I -->|Volatile assumption| J[Show reaction and ask confirmation]
+    J --> A
+    I -->|Yes| K[Show reaction, weighing results, gas reactants, byproducts]
+    K --> L{Recalculate?}
+    L -->|Yes| A
+    L -->|No| M[End workflow]
 ```
 
 ## Example

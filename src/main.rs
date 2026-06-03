@@ -38,6 +38,7 @@ struct WeighingResult {
 #[derive(Debug, Clone)]
 struct WeighingCalculation {
     results: Vec<WeighingResult>,
+    gas_reactants: Vec<WeighingResult>,
     volatile_byproducts: Vec<WeighingResult>,
     reaction_equation: String,
 }
@@ -103,6 +104,12 @@ impl WeighingAgentApp {
             if input.trim().is_empty() {
                 continue;
             }
+            if let Some(should_continue) = self.handle_local_command(&input)? {
+                if should_continue {
+                    continue;
+                }
+                break;
+            }
 
             self.update_state_from_user_input(&input);
             let prompt = self.state.wrap_user_input(&input);
@@ -129,9 +136,21 @@ impl WeighingAgentApp {
                 }
                 Ok(Some(input.trim().to_string()))
             }
-            Err(ReadlineError::Interrupted) => Ok(Some(String::new())),
+            Err(ReadlineError::Interrupted) => Ok(None),
             Err(ReadlineError::Eof) => Ok(None),
             Err(error) => Err(error.into()),
+        }
+    }
+
+    fn handle_local_command(&self, input: &str) -> Result<Option<bool>> {
+        match input.trim() {
+            "/quit" | "/exit" => Ok(Some(false)),
+            "/clear" => {
+                print!("\x1b[2J\x1b[H");
+                io::stdout().flush()?;
+                Ok(Some(true))
+            }
+            _ => Ok(None),
         }
     }
 
@@ -303,11 +322,11 @@ const AGENT_PREAMBLE: &str = r#"
 5a. 原料組成の一部が化学式ではなく曖昧な材料名に見える場合も、推測できる化学式候補を示して「この原料はこれですか？」と確認する。確認が取れるまで calculate_weighing tool を呼ばない。
 5b. 原料組成を聞いている場面で、あなたが直前に具体的な原料組成例や候補を提示しており、ユーザーが「OK」「はい」「それでOK」「それでよい」のような確認だけを返した場合は、その直前に提示した原料組成リストを採用する。直前に具体的な原料組成リストがない場合だけ、原料組成を化学式のリストで再入力してもらう。
 5c. 目的組成と目標質量がすでに会話履歴にある状態で原料組成を再入力してもらった場合、目的組成や目標質量を再度聞いてはいけない。そのまま既存の目的組成と目標質量と新しい原料リストで calculate_weighing tool を呼ぶ。
-6. 目的組成、目標質量、原料リストがそろったら、まず volatile_byproduct_formulas を指定せずに calculate_weighing tool を必ず呼ぶ。秤量値を自分で暗算・推測してはいけない。
+6. 目的組成、目標質量、原料リストがそろったら、まず volatile_byproduct_formulas を指定せずに calculate_weighing tool を必ず呼ぶ。原料リストに O2, N2, H2 などのガスが含まれる場合も除外せず、そのまま precursor_formulas に含める。秤量値を自分で暗算・推測してはいけない。
 7. tool が ok=false で、LiOH, Li2CO3, NH4H2PO4 などから CO2/H2O/NH3 等の揮発が考えられる場合は、あなたが妥当な揮発成分候補を考え、volatile_byproduct_formulas に入れて calculate_weighing tool を再度呼び、反応式の収支を確認する。
 8. 揮発成分を含む tool 結果が ok=true の場合は、必ず reaction_equation をユーザーに見せ、「この反応式では ... が揮発すると仮定します。それでもこの前提で秤量計算してよいですか？」と確認する。この時点では results の秤量値を表示しない。反応式がシステム表示済みの場合は同じ反応式を長く繰り返さず、確認文を続ける。
-9. ユーザーが揮発前提に同意した場合だけ、直前と同じ volatile_byproduct_formulas で calculate_weighing tool を呼び、reaction_equation と results に基づいて原料ごとの g, mg, mol をリスト表示する。volatile_byproducts も一文で示す。その後「再度計算しますか？」と聞く。
-10. 揮発なしで tool が ok=true の場合も、必ず reaction_equation を表示してから、tool の results だけを根拠に原料ごとの g, mg, mol をリスト表示する。その後「再度計算しますか？」と聞く。
+9. ユーザーが揮発前提に同意した場合だけ、直前と同じ volatile_byproduct_formulas で calculate_weighing tool を呼び、reaction_equation と results に基づいて固体・液体原料ごとの g, mg, mol をリスト表示する。gas_reactants が空でない場合は、ガス原料は秤量対象外だが元素収支に含めたことを一文で示す。volatile_byproducts も一文で示す。その後「再度計算しますか？」と聞く。
+10. 揮発なしで tool が ok=true の場合も、必ず reaction_equation を表示してから、tool の results だけを根拠に固体・液体原料ごとの g, mg, mol をリスト表示する。gas_reactants が空でない場合は、ガス原料は秤量対象外だが元素収支に含めたことを一文で示す。その後「再度計算しますか？」と聞く。
 11. 再計算する場合は目的組成と何g欲しいかを聞くところへ戻る。再計算しない場合は短く終了し、最後に [[END_WORKFLOW]] を付ける。
 
 応答は簡潔にしてください。ただし計算結果を出すときは「計算が完了しました。」のような短い完了文を入れてから結果を表示してください。計算根拠や説明は必要な場面だけにしてください。
@@ -696,6 +715,7 @@ struct CalculateWeighingOutput {
     target_formula: String,
     target_mass_g: f64,
     results: Vec<WeighingResult>,
+    gas_reactants: Vec<WeighingResult>,
     volatile_byproducts: Vec<WeighingResult>,
     reaction_equation: Option<String>,
     error: Option<String>,
@@ -731,7 +751,7 @@ impl Tool for CalculateWeighingTool {
                     },
                     "precursor_formulas": {
                         "type": "array",
-                        "description": "原料組成の化学式リスト",
+                        "description": "原料組成の化学式リスト。O2などのガス原料も除外せず含める。",
                         "items": { "type": "string" }
                     },
                     "volatile_byproduct_formulas": {
@@ -759,6 +779,7 @@ fn calculate_weighing_tool_output(args: CalculateWeighingArgs) -> CalculateWeigh
                 target_formula: args.target_formula,
                 target_mass_g: args.target_mass_g,
                 results: Vec::new(),
+                gas_reactants: Vec::new(),
                 volatile_byproducts: Vec::new(),
                 reaction_equation: None,
                 error: Some("目的組成が無機材料の組成として扱いにくい入力です。".to_string()),
@@ -771,6 +792,7 @@ fn calculate_weighing_tool_output(args: CalculateWeighingArgs) -> CalculateWeigh
                 target_formula: args.target_formula,
                 target_mass_g: args.target_mass_g,
                 results: Vec::new(),
+                gas_reactants: Vec::new(),
                 volatile_byproducts: Vec::new(),
                 reaction_equation: None,
                 error: Some(format!("目的組成が不正です: {error}")),
@@ -785,6 +807,7 @@ fn calculate_weighing_tool_output(args: CalculateWeighingArgs) -> CalculateWeigh
             target_formula: target.formula,
             target_mass_g: args.target_mass_g,
             results: Vec::new(),
+            gas_reactants: Vec::new(),
             volatile_byproducts: Vec::new(),
             reaction_equation: None,
             error: Some("目標質量は0より大きいg単位の数値で指定してください。".to_string()),
@@ -802,6 +825,7 @@ fn calculate_weighing_tool_output(args: CalculateWeighingArgs) -> CalculateWeigh
                     target_formula: target.formula,
                     target_mass_g: args.target_mass_g,
                     results: Vec::new(),
+                    gas_reactants: Vec::new(),
                     volatile_byproducts: Vec::new(),
                     reaction_equation: None,
                     error: Some(format!(
@@ -816,6 +840,7 @@ fn calculate_weighing_tool_output(args: CalculateWeighingArgs) -> CalculateWeigh
                     target_formula: target.formula,
                     target_mass_g: args.target_mass_g,
                     results: Vec::new(),
+                    gas_reactants: Vec::new(),
                     volatile_byproducts: Vec::new(),
                     reaction_equation: None,
                     error: Some(format!("原料 {formula} が不正です: {error}")),
@@ -835,6 +860,7 @@ fn calculate_weighing_tool_output(args: CalculateWeighingArgs) -> CalculateWeigh
                     target_formula: target.formula,
                     target_mass_g: args.target_mass_g,
                     results: Vec::new(),
+                    gas_reactants: Vec::new(),
                     volatile_byproducts: Vec::new(),
                     reaction_equation: None,
                     error: Some(format!("揮発副生成物 {formula} が不正です: {error}")),
@@ -855,6 +881,7 @@ fn calculate_weighing_tool_output(args: CalculateWeighingArgs) -> CalculateWeigh
             target_formula: target.formula,
             target_mass_g: args.target_mass_g,
             results: calculation.results,
+            gas_reactants: calculation.gas_reactants,
             volatile_byproducts: calculation.volatile_byproducts,
             reaction_equation: Some(calculation.reaction_equation),
             error: None,
@@ -865,6 +892,7 @@ fn calculate_weighing_tool_output(args: CalculateWeighingArgs) -> CalculateWeigh
             target_formula: target.formula.clone(),
             target_mass_g: args.target_mass_g,
             results: Vec::new(),
+            gas_reactants: Vec::new(),
             volatile_byproducts: Vec::new(),
             reaction_equation: None,
             error: Some(explain_calculation_error(&error, &target, &precursors)),
@@ -1052,6 +1080,13 @@ fn is_inorganic_material_like(compound: &Compound) -> bool {
         }))
 }
 
+fn is_gas_reactant(compound: &Compound) -> bool {
+    matches!(
+        compound.formula.as_str(),
+        "H2" | "N2" | "O2" | "F2" | "Cl2" | "He" | "Ne" | "Ar" | "Kr" | "Xe" | "Rn"
+    )
+}
+
 fn calculate_weighing(
     target: &Compound,
     target_mass_g: f64,
@@ -1098,6 +1133,24 @@ fn calculate_weighing(
     Ok(results)
 }
 
+fn split_gas_reactants(
+    precursors: &[Compound],
+    precursor_results: Vec<WeighingResult>,
+) -> (Vec<WeighingResult>, Vec<WeighingResult>) {
+    let mut weighed_results = Vec::new();
+    let mut gas_reactants = Vec::new();
+
+    for (compound, result) in precursors.iter().zip(precursor_results) {
+        if is_gas_reactant(compound) && result.moles > 0.0 {
+            gas_reactants.push(result);
+        } else {
+            weighed_results.push(result);
+        }
+    }
+
+    (weighed_results, gas_reactants)
+}
+
 fn calculate_weighing_with_optional_volatiles(
     target: &Compound,
     target_mass_g: f64,
@@ -1105,12 +1158,20 @@ fn calculate_weighing_with_optional_volatiles(
     volatile_byproducts: Vec<Compound>,
 ) -> Result<WeighingCalculation, CalculationError> {
     if volatile_byproducts.is_empty() {
-        let results = calculate_weighing(target, target_mass_g, precursors)?;
+        let precursor_results = calculate_weighing(target, target_mass_g, precursors)?;
         let target_moles = target_mass_g / target.molar_mass;
-        let reaction_equation =
-            format_reaction_equation(precursors, &results, target, target_moles, &[], &[]);
+        let reaction_equation = format_reaction_equation(
+            precursors,
+            &precursor_results,
+            target,
+            target_moles,
+            &[],
+            &[],
+        );
+        let (results, gas_reactants) = split_gas_reactants(precursors, precursor_results);
         Ok(WeighingCalculation {
             results,
+            gas_reactants,
             volatile_byproducts: Vec::new(),
             reaction_equation,
         })
@@ -1164,7 +1225,7 @@ fn calculate_weighing_with_volatile_byproducts(
     let solution = solve_unique_linear_system(matrix, unknown_count)?;
     let (precursor_moles, byproduct_moles) = solution.split_at(precursors.len());
 
-    let mut results = Vec::new();
+    let mut precursor_results = Vec::new();
     for (compound, moles) in precursors.iter().zip(precursor_moles.iter().copied()) {
         if moles < -EPS {
             return Err(CalculationError::NegativeAmount {
@@ -1173,7 +1234,7 @@ fn calculate_weighing_with_volatile_byproducts(
             });
         }
         let moles = if moles.abs() < EPS { 0.0 } else { moles };
-        results.push(WeighingResult {
+        precursor_results.push(WeighingResult {
             formula: compound.formula.clone(),
             moles,
             grams: moles * compound.molar_mass,
@@ -1201,16 +1262,20 @@ fn calculate_weighing_with_volatile_byproducts(
         }
     }
 
+    let reaction_equation = format_reaction_equation(
+        precursors,
+        &precursor_results,
+        target,
+        target_moles,
+        &volatile_byproducts,
+        &volatile_results,
+    );
+    let (results, gas_reactants) = split_gas_reactants(precursors, precursor_results);
+
     Ok(WeighingCalculation {
-        reaction_equation: format_reaction_equation(
-            precursors,
-            &results,
-            target,
-            target_moles,
-            &volatile_byproducts,
-            &volatile_results,
-        ),
+        reaction_equation,
         results,
+        gas_reactants,
         volatile_byproducts: volatile_results,
     })
 }
@@ -1623,6 +1688,34 @@ mod tests {
         assert_eq!(
             calculation.reaction_equation,
             "0.65 Li2CO3 + 0.15 Al2O3 + 1.7 TiO2 + 3 NH4H2PO4 -> Li1.3Al0.3Ti1.7(PO4)3 + 0.65 CO2 + 4.5 H2O + 3 NH3"
+        );
+    }
+
+    #[test]
+    fn calculates_with_gas_reactant_excluded_from_weighing_results() {
+        let target = parse_compound("LaCoO3").unwrap();
+        let precursors = ["La2O3", "Co3O4", "O2"]
+            .into_iter()
+            .map(parse_compound)
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+
+        let calculation =
+            calculate_weighing_with_optional_volatiles(&target, 10.0, &precursors, Vec::new())
+                .unwrap();
+
+        assert_eq!(calculation.results.len(), 2);
+        assert_eq!(calculation.results[0].formula, "La2O3");
+        assert_eq!(calculation.results[1].formula, "Co3O4");
+        assert!((calculation.results[0].grams - 6.6265).abs() < 1.0e-4);
+        assert!((calculation.results[1].grams - 3.2650).abs() < 1.0e-4);
+
+        assert_eq!(calculation.gas_reactants.len(), 1);
+        assert_eq!(calculation.gas_reactants[0].formula, "O2");
+        assert!((calculation.gas_reactants[0].moles - 0.0033898).abs() < 1.0e-7);
+        assert_eq!(
+            calculation.reaction_equation,
+            "0.5 La2O3 + 0.333333 Co3O4 + 0.083333 O2 -> LaCoO3"
         );
     }
 

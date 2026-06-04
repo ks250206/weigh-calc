@@ -20,6 +20,7 @@ use tokio::time::{Duration, Instant, timeout};
 const EPS: f64 = 1.0e-8;
 const STREAM_CHUNK_TIMEOUT_SECS: u64 = 90;
 const STREAM_TOTAL_TIMEOUT_SECS: u64 = 240;
+const DEFAULT_OLLAMA_NUM_CTX: u64 = 9068;
 
 #[derive(Debug, Clone)]
 struct Compound {
@@ -59,6 +60,7 @@ async fn main() -> Result<()> {
 struct WeighingAgentApp {
     ollama_base_url: String,
     model: String,
+    ollama_num_ctx: u64,
     line_editor: DefaultEditor,
     state: ConversationState,
     last_suggested_formulas: Vec<String>,
@@ -70,6 +72,7 @@ impl WeighingAgentApp {
             ollama_base_url: std::env::var("OLLAMA_BASE_URL")
                 .unwrap_or_else(|_| "http://localhost:11434".to_string()),
             model: std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| "qwen3.6:35b".to_string()),
+            ollama_num_ctx: parse_ollama_num_ctx(std::env::var("OLLAMA_NUM_CTX").ok())?,
             line_editor: DefaultEditor::new()?,
             state: ConversationState::default(),
             last_suggested_formulas: Vec::new(),
@@ -81,7 +84,7 @@ impl WeighingAgentApp {
         let agent = client
             .agent(&self.model)
             .preamble(AGENT_PREAMBLE)
-            .additional_params(json!({ "think": true }))
+            .additional_params(json!({ "think": true, "num_ctx": self.ollama_num_ctx }))
             .default_max_turns(8)
             .tool(ValidateFormulaTool)
             .tool(CalculateWeighingTool)
@@ -192,6 +195,22 @@ impl WeighingAgentApp {
             self.last_suggested_formulas = formulas;
         }
     }
+}
+
+fn parse_ollama_num_ctx(value: Option<String>) -> Result<u64> {
+    let Some(value) = value else {
+        return Ok(DEFAULT_OLLAMA_NUM_CTX);
+    };
+
+    let trimmed = value.trim();
+    let parsed = trimmed
+        .parse::<u64>()
+        .map_err(|_| anyhow::anyhow!("OLLAMA_NUM_CTX must be a positive integer: {trimmed}"))?;
+    if parsed == 0 {
+        bail!("OLLAMA_NUM_CTX must be greater than 0");
+    }
+
+    Ok(parsed)
 }
 
 const END_MARKER: &str = "[[END_WORKFLOW]]";
@@ -1584,6 +1603,17 @@ mod tests {
         assert_eq!(compound.atoms["Ca"], 1.0);
         assert_eq!(compound.atoms["O"], 2.0);
         assert_eq!(compound.atoms["H"], 2.0);
+    }
+
+    #[test]
+    fn parses_ollama_num_ctx_setting() {
+        assert_eq!(parse_ollama_num_ctx(None).unwrap(), DEFAULT_OLLAMA_NUM_CTX);
+        assert_eq!(
+            parse_ollama_num_ctx(Some(" 16384 ".to_string())).unwrap(),
+            16384
+        );
+        assert!(parse_ollama_num_ctx(Some("0".to_string())).is_err());
+        assert!(parse_ollama_num_ctx(Some("large".to_string())).is_err());
     }
 
     #[test]

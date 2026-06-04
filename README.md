@@ -27,10 +27,16 @@
 cargo run
 ```
 
-モデルや Ollama URL は環境変数で変更できます。
+モデル、Ollama URL、Ollama context size は環境変数で変更できます。
+
+| 環境変数 | 既定値 | 説明 |
+| --- | --- | --- |
+| `OLLAMA_BASE_URL` | `http://localhost:11434` | 接続先の Ollama URL |
+| `OLLAMA_MODEL` | `qwen3.6:35b` | 使用する Ollama model |
+| `OLLAMA_NUM_CTX` | `9068` | Ollama に渡す context size (`num_ctx`) |
 
 ```bash
-OLLAMA_BASE_URL=http://localhost:11434 OLLAMA_MODEL=qwen3.6:35b cargo run
+OLLAMA_BASE_URL=http://localhost:11434 OLLAMA_MODEL=qwen3.6:35b OLLAMA_NUM_CTX=9068 cargo run
 ```
 
 CLI の終了と画面操作:

@@ -4,6 +4,7 @@ use rig::agent::{MultiTurnStreamItem, StreamingResult};
 use rig::completion::Message;
 use rig::message::{ReasoningContent, ToolResult, ToolResultContent};
 use rig::streaming::{StreamedAssistantContent, StreamedUserContent};
+use serde::Deserialize;
 use std::collections::BTreeSet;
 use std::io::{self, Write};
 use tokio::time::{Duration, Instant, timeout};
@@ -28,6 +29,7 @@ where
     let mut thinking_char_count = 0usize;
     let mut suppress_duplicate_reaction_line = false;
     let mut duplicate_reaction_line_buffer = String::new();
+    let mut suppress_assistant_after_deterministic_result = false;
     let mut updated_history = None;
     let started_at = Instant::now();
 
@@ -63,6 +65,9 @@ where
             MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(text)) => {
                 clear_thinking_indicator(&mut showing_thinking)?;
                 response_text.push_str(&text.text);
+                if suppress_assistant_after_deterministic_result {
+                    continue;
+                }
                 let sanitized = sanitize_assistant_text(&text.text);
                 let filtered = filter_duplicate_reaction_line(
                     &sanitized,
@@ -107,10 +112,13 @@ where
                     println!();
                 }
                 printed_visible_text |= flushed_text;
-                printed_visible_text |= print_reaction_equation_from_tool_result(
+                let tool_print_result = print_calculation_from_tool_result(
                     &tool_result,
                     &mut printed_reaction_equations,
                 )?;
+                printed_visible_text |= tool_print_result.printed;
+                suppress_assistant_after_deterministic_result |=
+                    tool_print_result.printed_deterministic_result;
             }
             MultiTurnStreamItem::FinalResponse(response) => {
                 clear_thinking_indicator(&mut showing_thinking)?;
@@ -223,34 +231,122 @@ fn clear_thinking_indicator(showing_thinking: &mut bool) -> Result<()> {
     Ok(())
 }
 
-fn print_reaction_equation_from_tool_result(
+#[derive(Debug, Default)]
+struct ToolPrintResult {
+    printed: bool,
+    printed_deterministic_result: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct CalculationToolResult {
+    ok: bool,
+    results: Vec<CalculationItem>,
+    gas_reactants: Vec<CalculationItem>,
+    volatile_byproducts: Vec<CalculationItem>,
+    reaction_equation: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CalculationItem {
+    formula: String,
+    moles: f64,
+    grams: f64,
+}
+
+fn print_calculation_from_tool_result(
     tool_result: &ToolResult,
     printed_reaction_equations: &mut BTreeSet<String>,
-) -> Result<bool> {
+) -> Result<ToolPrintResult> {
     for content in tool_result.content.iter() {
         let ToolResultContent::Text(text) = content else {
             continue;
         };
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(&text.text) else {
+        let Ok(value) = serde_json::from_str::<CalculationToolResult>(&text.text) else {
             continue;
         };
-        if value.get("ok").and_then(|ok| ok.as_bool()) != Some(true) {
+        if !value.ok {
             continue;
         }
         let Some(equation) = value
-            .get("reaction_equation")
-            .and_then(|equation| equation.as_str())
+            .reaction_equation
+            .as_deref()
             .filter(|equation| !equation.is_empty())
         else {
             continue;
         };
-        if printed_reaction_equations.insert(equation.to_string()) {
-            println!("反応式: {equation}");
-            return Ok(true);
+
+        if !value.volatile_byproducts.is_empty() {
+            if printed_reaction_equations.insert(equation.to_string()) {
+                println!("反応式: {equation}");
+                return Ok(ToolPrintResult {
+                    printed: true,
+                    printed_deterministic_result: false,
+                });
+            }
+            return Ok(ToolPrintResult::default());
         }
+
+        if !printed_reaction_equations.insert(equation.to_string()) {
+            return Ok(ToolPrintResult::default());
+        }
+
+        print!(
+            "{}",
+            format_deterministic_calculation_result(equation, &value)
+        );
+        io::stdout().flush()?;
+        return Ok(ToolPrintResult {
+            printed: true,
+            printed_deterministic_result: true,
+        });
     }
 
-    Ok(false)
+    Ok(ToolPrintResult::default())
+}
+
+fn format_deterministic_calculation_result(
+    equation: &str,
+    value: &CalculationToolResult,
+) -> String {
+    let mut output = format!("反応式: {equation}\n\n計算が完了しました。\n\n");
+    for result in &value.results {
+        output.push_str(&format!(
+            "- {}: {:.4} g, {:.1} mg, {} mol\n",
+            result.formula,
+            result.grams,
+            result.grams * 1000.0,
+            format_significant(result.moles, 4)
+        ));
+    }
+    if !value.gas_reactants.is_empty() {
+        let gas_formulas = value
+            .gas_reactants
+            .iter()
+            .map(|result| result.formula.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        output.push_str(&format!(
+            "\nガス原料（{gas_formulas}）は秤量対象外ですが、元素収支に含めて計算しました。\n"
+        ));
+    }
+    output.push_str("\n再度計算しますか？\n");
+    output
+}
+
+fn format_significant(value: f64, significant_digits: i32) -> String {
+    if value == 0.0 {
+        return "0".to_string();
+    }
+
+    let abs = value.abs();
+    let digits_before_decimal = abs.log10().floor() as i32 + 1;
+    let decimals = (significant_digits - digits_before_decimal).max(0) as usize;
+    let text = format!("{value:.decimals$}");
+    if text.contains('.') {
+        text.trim_end_matches('0').trim_end_matches('.').to_string()
+    } else {
+        text
+    }
 }
 
 fn flush_visible_stream_text(pending_text: &mut String, force: bool) -> Result<bool> {
@@ -297,4 +393,40 @@ fn flush_visible_stream_text(pending_text: &mut String, force: bool) -> Result<b
     io::stdout().flush()?;
     *pending_text = tail;
     Ok(!visible.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn formats_nonvolatile_tool_result_with_weighing_values() {
+        let value: CalculationToolResult = serde_json::from_value(serde_json::json!({
+            "ok": true,
+            "results": [
+                { "formula": "Li2O", "moles": 0.01533, "grams": 0.4579 },
+                { "formula": "Co3O4", "moles": 0.01022, "grams": 2.4603 }
+            ],
+            "gas_reactants": [
+                { "formula": "O2", "moles": 0.002555, "grams": 0.08176 }
+            ],
+            "volatile_byproducts": [],
+            "reaction_equation": "0.5 Li2O + 0.333333 Co3O4 + 0.083333 O2 -> LiCoO2"
+        }))
+        .unwrap();
+
+        let formatted = format_deterministic_calculation_result(
+            value.reaction_equation.as_deref().unwrap(),
+            &value,
+        );
+
+        assert!(formatted.contains("反応式: 0.5 Li2O + 0.333333 Co3O4 + 0.083333 O2 -> LiCoO2"));
+        assert!(formatted.contains("計算が完了しました。"));
+        assert!(formatted.contains("- Li2O: 0.4579 g, 457.9 mg, 0.01533 mol"));
+        assert!(formatted.contains("- Co3O4: 2.4603 g, 2460.3 mg, 0.01022 mol"));
+        assert!(
+            formatted.contains("ガス原料（O2）は秤量対象外ですが、元素収支に含めて計算しました。")
+        );
+        assert!(formatted.ends_with("再度計算しますか？\n"));
+    }
 }

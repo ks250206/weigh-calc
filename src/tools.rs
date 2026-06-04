@@ -96,6 +96,11 @@ impl Tool for ValidateFormulaTool {
 pub(crate) struct CalculateWeighingArgs {
     target_formula: String,
     target_mass_g: f64,
+    #[serde(
+        alias = "prior_formulae",
+        alias = "precursor_formulae",
+        alias = "precursors"
+    )]
     precursor_formulas: Vec<String>,
     #[serde(default)]
     volatile_byproduct_formulas: Vec<String>,
@@ -143,7 +148,7 @@ impl Tool for CalculateWeighingTool {
                     },
                     "precursor_formulas": {
                         "type": "array",
-                        "description": "原料組成の化学式リスト。O2などのガス原料も除外せず含める。",
+                        "description": "原料組成の化学式リスト。引数名は必ず precursor_formulas と正確に書く。prior_formulae, precursor_formulae, precursors は使わない。O2などのガス原料も除外せず含める。",
                         "items": { "type": "string" }
                     },
                     "volatile_byproduct_formulas": {
@@ -159,6 +164,25 @@ impl Tool for CalculateWeighingTool {
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         Ok(calculate_weighing_tool_output(args))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_legacy_precursor_formula_aliases() {
+        for key in ["prior_formulae", "precursor_formulae", "precursors"] {
+            let args: CalculateWeighingArgs = serde_json::from_value(serde_json::json!({
+                "target_formula": "LiCoO2",
+                "target_mass_g": 1.0,
+                key: ["Li2CO3", "Co3O4"]
+            }))
+            .unwrap();
+
+            assert_eq!(args.precursor_formulas, ["Li2CO3", "Co3O4"]);
+        }
     }
 }
 

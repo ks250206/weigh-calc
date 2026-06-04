@@ -24,13 +24,13 @@ use chemistry::{
 };
 use conversation::{
     ConversationState, extract_mass_g, extract_valid_formulas, guess_material_formula,
-    is_confirmation_only,
+    is_confirmation_only, references_suggested_formulas,
 };
 #[cfg(test)]
 use prompt::AGENT_PREAMBLE;
 #[cfg(test)]
 use serde_json::json;
-use streaming_ui::{AgentStreamPrintResult, print_streaming_agent_response};
+use streaming_ui::{AgentStreamPrintResult, print_streaming_agent_response, stream_text};
 use tools::{CalculateWeighingTool, ValidateFormulaTool};
 
 #[tokio::main]
@@ -46,6 +46,10 @@ struct WeighingAgentApp {
     line_editor: DefaultEditor,
     state: ConversationState,
     last_suggested_formulas: Vec<String>,
+    pending_volatile_result: Option<String>,
+    pending_volatile_calculation_record: Option<String>,
+    last_calculation_summary: Option<String>,
+    calculation_records: Vec<String>,
 }
 
 impl WeighingAgentApp {
@@ -58,6 +62,10 @@ impl WeighingAgentApp {
             line_editor: DefaultEditor::new()?,
             state: ConversationState::default(),
             last_suggested_formulas: Vec::new(),
+            pending_volatile_result: None,
+            pending_volatile_calculation_record: None,
+            last_calculation_summary: None,
+            calculation_records: Vec::new(),
         })
     }
 
@@ -105,26 +113,55 @@ impl WeighingAgentApp {
                 break;
             }
 
+            if self.pending_volatile_result.is_some() {
+                if is_confirmation_only(&input) {
+                    if let Some(result_text) = self.pending_volatile_result.take() {
+                        stream_text(&result_text).await?;
+                        self.update_last_calculation_summary();
+                        if let Some(record) = self.pending_volatile_calculation_record.take() {
+                            self.add_calculation_record(record);
+                        }
+                        awaiting_recalculate_answer = true;
+                        continue;
+                    }
+                } else if is_rejection_only(&input) {
+                    self.pending_volatile_result = None;
+                    self.pending_volatile_calculation_record = None;
+                    println!(
+                        "揮発前提を変更する場合は、揮発成分または原料組成を具体的に入力してください。"
+                    );
+                    continue;
+                }
+            }
+
             if awaiting_recalculate_answer {
                 match classify_recalculate_answer(&input) {
                     RecalculateAnswer::Restart => {
                         self.reset_calculation_state();
                         chat_history.clear();
+                        chat_history.push(Message::assistant(
+                            "再計算を開始します。自己紹介は繰り返さず、作りたい組成と目標質量を確認します。",
+                        ));
                         awaiting_recalculate_answer = false;
                         println!("作りたい組成（化学式）と、何g欲しいか教えてください。");
                         continue;
                     }
                     RecalculateAnswer::End => break,
                     RecalculateAnswer::NewRequest => {
-                        self.reset_calculation_state();
                         chat_history.clear();
+                        chat_history.push(Message::assistant(self.recalculation_context_message()));
                         awaiting_recalculate_answer = false;
                     }
                 }
             }
 
             self.update_state_from_user_input(&input);
-            let prompt = self.state.wrap_user_input(&input);
+            let prompt = self.state.wrap_user_input(
+                &input,
+                &self.last_suggested_formulas,
+                self.last_calculation_summary.as_deref(),
+                &self.calculation_records,
+            );
             let stream = agent.stream_chat(prompt, chat_history.clone()).await;
             let stream_result = print_streaming_agent_response(stream).await?;
             let should_end = self.apply_stream_result(
@@ -170,12 +207,15 @@ impl WeighingAgentApp {
     }
 
     fn update_state_from_user_input(&mut self, input: &str) {
-        if is_confirmation_only(input)
+        let adopted_suggested_precursors = (is_confirmation_only(input)
+            || references_suggested_formulas(input))
+            && self.state.precursor_formulas.is_empty()
+            && !self.last_suggested_formulas.is_empty();
+        if (is_confirmation_only(input) || references_suggested_formulas(input))
             && self.state.precursor_formulas.is_empty()
             && !self.last_suggested_formulas.is_empty()
         {
             self.state.precursor_formulas = self.last_suggested_formulas.clone();
-            return;
         }
 
         let formulas = extract_valid_formulas(input);
@@ -185,7 +225,10 @@ impl WeighingAgentApp {
             } else if let Some(formula) = guess_material_formula(input) {
                 self.last_suggested_formulas = vec![formula];
             }
-        } else if self.state.target_mass_g.is_some() && !formulas.is_empty() {
+        } else if self.state.target_mass_g.is_some()
+            && !formulas.is_empty()
+            && !adopted_suggested_precursors
+        {
             let target = self.state.target_formula.as_deref();
             let precursor_formulas = formulas
                 .into_iter()
@@ -211,6 +254,41 @@ impl WeighingAgentApp {
     fn reset_calculation_state(&mut self) {
         self.state = ConversationState::default();
         self.last_suggested_formulas.clear();
+        self.pending_volatile_result = None;
+        self.pending_volatile_calculation_record = None;
+        self.last_calculation_summary = None;
+        self.calculation_records.clear();
+    }
+
+    fn update_last_calculation_summary(&mut self) {
+        let Some(target_formula) = self.state.target_formula.as_deref() else {
+            return;
+        };
+        let Some(target_mass_g) = self.state.target_mass_g else {
+            return;
+        };
+        let precursor_formulas = if self.state.precursor_formulas.is_empty() {
+            "未確定".to_string()
+        } else {
+            self.state.precursor_formulas.join(", ")
+        };
+        self.last_calculation_summary = Some(format!(
+            "目的組成: {target_formula}; 目標質量_g: {target_mass_g}; 原料組成: {precursor_formulas}"
+        ));
+    }
+
+    fn recalculation_context_message(&self) -> String {
+        match self.last_calculation_summary.as_deref() {
+            Some(summary) => format!(
+                "前回計算のバリエーションとして処理します。自己紹介は繰り返さず、前回計算要約とこれまでの計算一覧を参照して、ユーザーの変更指示だけを反映します。前回計算要約: {summary}"
+            ),
+            None => "再計算を開始します。自己紹介は繰り返さず、ユーザーの新しい依頼を処理します。"
+                .to_string(),
+        }
+    }
+
+    fn add_calculation_record(&mut self, record: String) {
+        self.calculation_records.push(record);
     }
 
     fn apply_stream_result(
@@ -225,7 +303,16 @@ impl WeighingAgentApp {
             *chat_history = updated_history;
         }
         if stream_result.printed_deterministic_result {
+            self.update_last_calculation_summary();
+            if let Some(record) = stream_result.completed_calculation_record {
+                self.add_calculation_record(record);
+            }
             *awaiting_recalculate_answer = true;
+        }
+        if stream_result.pending_volatile_result.is_some() {
+            self.pending_volatile_result = stream_result.pending_volatile_result;
+            self.pending_volatile_calculation_record =
+                stream_result.pending_volatile_calculation_record;
         }
         should_end
     }
@@ -252,6 +339,19 @@ fn classify_recalculate_answer(input: &str) -> RecalculateAnswer {
         "いいえ" | "no" | "n" | "終了" | "終わり" | "やめる" => RecalculateAnswer::End,
         _ => RecalculateAnswer::NewRequest,
     }
+}
+
+fn is_rejection_only(input: &str) -> bool {
+    let normalized = input
+        .trim()
+        .trim_matches(|ch: char| {
+            ch.is_ascii_punctuation() || matches!(ch, '。' | '、' | '？' | '！')
+        })
+        .to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "いいえ" | "no" | "n" | "違う" | "ちがう" | "だめ" | "ng"
+    )
 }
 
 #[cfg(test)]
@@ -352,6 +452,97 @@ mod tests {
             classify_recalculate_answer("LiCoO2 3g"),
             RecalculateAnswer::NewRequest
         );
+    }
+
+    #[test]
+    fn accepts_example_confirmation_phrases() {
+        for input in [
+            "それでお願い",
+            "それでお願いします。",
+            "その例の通りで",
+            "その例どおりで",
+            "その通りで",
+            "その組成で",
+            "例の通りで",
+            "例のリストで",
+            "そのリストで",
+            "提示したリストで",
+        ] {
+            assert!(is_confirmation_only(input), "{input}");
+        }
+    }
+
+    #[test]
+    fn wraps_last_suggested_formulas_into_user_prompt() {
+        let state = ConversationState {
+            target_formula: Some("LaCu3Mn4O12".to_string()),
+            target_mass_g: Some(5.0),
+            precursor_formulas: Vec::new(),
+        };
+        let prompt = state.wrap_user_input(
+            "例のリストで",
+            &["La2O3".to_string(), "CuO".to_string(), "Mn2O3".to_string()],
+            None,
+            &[],
+        );
+
+        assert!(prompt.contains("原料組成: 未確定"));
+        assert!(prompt.contains("直前提示組成候補: La2O3, CuO, Mn2O3"));
+        assert!(prompt.contains("[ユーザー入力]\n例のリストで"));
+    }
+
+    #[test]
+    fn wraps_previous_calculation_summary_into_user_prompt() {
+        let state = ConversationState {
+            target_formula: Some("LaCu3Mn4O12".to_string()),
+            target_mass_g: Some(5.0),
+            precursor_formulas: vec!["La2O3".to_string(), "CuO".to_string(), "Mn2O3".to_string()],
+        };
+        let summary = "目的組成: LaCu3Mn4O12; 目標質量_g: 5; 原料組成: La2O3, CuO, Mn2O3";
+        let prompt = state.wrap_user_input(
+            "3gを5gにして",
+            &[],
+            Some(summary),
+            &["作製材料: LaCu3Mn4O12; 目標質量_g: 5; 反応式: 0.5 La2O3 + 3 CuO + 2 Mn2O3 -> LaCu3Mn4O12".to_string()],
+        );
+
+        assert!(prompt.contains("前回計算要約: 目的組成: LaCu3Mn4O12"));
+        assert!(prompt.contains("確定済み項目: 目的組成, 目標質量, 原料組成"));
+        assert!(prompt.contains("これまでの計算一覧:\n1. 作製材料: LaCu3Mn4O12"));
+        assert!(prompt.contains("[ユーザー入力]\n3gを5gにして"));
+    }
+
+    #[test]
+    fn adopts_suggested_precursors_with_extra_volatile_note() {
+        let mut app = WeighingAgentApp {
+            ollama_base_url: "http://localhost:11434".to_string(),
+            model: "qwen3.6:35b".to_string(),
+            ollama_num_ctx: DEFAULT_OLLAMA_NUM_CTX,
+            line_editor: DefaultEditor::new().unwrap(),
+            state: ConversationState {
+                target_formula: Some("LaTaO3".to_string()),
+                target_mass_g: Some(5.0),
+                precursor_formulas: Vec::new(),
+            },
+            last_suggested_formulas: vec!["La2O3".to_string(), "Ta2O5".to_string()],
+            pending_volatile_result: None,
+            pending_volatile_calculation_record: None,
+            last_calculation_summary: None,
+            calculation_records: Vec::new(),
+        };
+
+        app.update_state_from_user_input("それでOK.O2脱離するから組成式反映させてね");
+
+        assert_eq!(app.state.target_formula.as_deref(), Some("LaTaO3"));
+        assert_eq!(app.state.target_mass_g, Some(5.0));
+        assert_eq!(app.state.precursor_formulas, ["La2O3", "Ta2O5"]);
+    }
+
+    #[test]
+    fn extracts_last_inline_mass_request() {
+        assert_eq!(extract_mass_g("3gを5gにして"), Some(5.0));
+        assert_eq!(extract_mass_g("前回と同じで 2.5g"), Some(2.5));
+        assert_eq!(extract_mass_g("500mgではなく1g"), Some(1.0));
     }
 
     #[test]

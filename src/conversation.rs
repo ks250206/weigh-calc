@@ -8,9 +8,15 @@ pub(crate) struct ConversationState {
 }
 
 impl ConversationState {
-    pub(crate) fn wrap_user_input(&self, input: &str) -> String {
+    pub(crate) fn wrap_user_input(
+        &self,
+        input: &str,
+        last_suggested_formulas: &[String],
+        last_calculation_summary: Option<&str>,
+        calculation_records: &[String],
+    ) -> String {
         format!(
-            "[現在の状態]\n目的組成: {}\n目標質量_g: {}\n原料組成: {}\n\n[ユーザー入力]\n{}",
+            "[現在の状態]\n目的組成: {}\n目標質量_g: {}\n原料組成: {}\n確定済み項目: {}\n直前提示組成候補: {}\n前回計算要約: {}\nこれまでの計算一覧:\n{}\n\n[ユーザー入力]\n{}",
             self.target_formula.as_deref().unwrap_or("未確定"),
             self.target_mass_g
                 .map(|mass| format!("{mass}"))
@@ -20,9 +26,48 @@ impl ConversationState {
             } else {
                 self.precursor_formulas.join(", ")
             },
+            self.confirmed_fields_text(),
+            if last_suggested_formulas.is_empty() {
+                "なし".to_string()
+            } else {
+                last_suggested_formulas.join(", ")
+            },
+            last_calculation_summary.unwrap_or("なし"),
+            format_calculation_records(calculation_records),
             input
         )
     }
+
+    fn confirmed_fields_text(&self) -> String {
+        let mut fields = Vec::new();
+        if self.target_formula.is_some() {
+            fields.push("目的組成");
+        }
+        if self.target_mass_g.is_some() {
+            fields.push("目標質量");
+        }
+        if !self.precursor_formulas.is_empty() {
+            fields.push("原料組成");
+        }
+        if fields.is_empty() {
+            "なし".to_string()
+        } else {
+            fields.join(", ")
+        }
+    }
+}
+
+fn format_calculation_records(records: &[String]) -> String {
+    if records.is_empty() {
+        return "なし".to_string();
+    }
+
+    records
+        .iter()
+        .enumerate()
+        .map(|(index, record)| format!("{}. {}", index + 1, record))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 pub(crate) fn is_confirmation_only(input: &str) -> bool {
@@ -32,8 +77,51 @@ pub(crate) fn is_confirmation_only(input: &str) -> bool {
         .to_ascii_lowercase();
     matches!(
         normalized.as_str(),
-        "ok" | "yes" | "y" | "はい" | "それでok" | "それでよい" | "それで良い" | "それでいい"
+        "ok" | "yes"
+            | "y"
+            | "はい"
+            | "お願いします"
+            | "お願い"
+            | "それで"
+            | "それでok"
+            | "それでよい"
+            | "それで良い"
+            | "それでいい"
+            | "それでお願い"
+            | "それでお願いします"
+            | "その例の通りで"
+            | "その例どおりで"
+            | "その通りで"
+            | "そのとおりで"
+            | "その組成で"
+            | "例の通りで"
+            | "例どおりで"
+            | "例のリストで"
+            | "例リストで"
+            | "提示リストで"
+            | "提示したリストで"
+            | "そのリストで"
     )
+}
+
+pub(crate) fn references_suggested_formulas(input: &str) -> bool {
+    let normalized = input
+        .trim()
+        .trim_matches(|ch: char| ch.is_ascii_punctuation() || matches!(ch, '。' | '、'))
+        .to_ascii_lowercase();
+
+    [
+        "それで",
+        "その例",
+        "例の",
+        "そのリスト",
+        "提示",
+        "その組成",
+        "ok",
+        "はい",
+    ]
+    .iter()
+    .any(|pattern| normalized.contains(pattern))
 }
 
 pub(crate) fn extract_valid_formulas(input: &str) -> Vec<String> {
@@ -87,6 +175,10 @@ pub(crate) fn guess_material_formula(input: &str) -> Option<String> {
 }
 
 pub(crate) fn extract_mass_g(input: &str) -> Option<f64> {
+    if let Some(value) = extract_last_inline_mass_g(input) {
+        return Some(value);
+    }
+
     for token in input.split_whitespace() {
         let normalized = token
             .trim()
@@ -111,4 +203,44 @@ pub(crate) fn extract_mass_g(input: &str) -> Option<f64> {
         .parse::<f64>()
         .ok()
         .filter(|value| *value > 0.0)
+}
+
+fn extract_last_inline_mass_g(input: &str) -> Option<f64> {
+    let mut last_mass = None;
+    let mut iter = input.char_indices().peekable();
+
+    while let Some((start, ch)) = iter.next() {
+        if !ch.is_ascii_digit() && ch != '.' {
+            continue;
+        }
+
+        let mut end = start + ch.len_utf8();
+        while let Some((index, next_ch)) = iter.peek().copied() {
+            if next_ch.is_ascii_digit() || next_ch == '.' {
+                end = index + next_ch.len_utf8();
+                iter.next();
+            } else {
+                break;
+            }
+        }
+
+        let Some((_, unit)) = iter.peek().copied() else {
+            continue;
+        };
+        if unit != 'g' && unit != 'G' {
+            continue;
+        }
+        if input[..start].ends_with('m') || input[..start].ends_with('M') {
+            continue;
+        }
+
+        if let Ok(value) = input[start..end].parse::<f64>()
+            && value.is_finite()
+            && value > 0.0
+        {
+            last_mass = Some(value);
+        }
+    }
+
+    last_mass
 }

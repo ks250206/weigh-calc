@@ -10,7 +10,7 @@ use rig::tool::Tool;
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
@@ -21,6 +21,41 @@ const EPS: f64 = 1.0e-8;
 const STREAM_CHUNK_TIMEOUT_SECS: u64 = 90;
 const STREAM_TOTAL_TIMEOUT_SECS: u64 = 240;
 const DEFAULT_OLLAMA_NUM_CTX: u64 = 9068;
+const THINK_BOOL_MODEL_MARKERS: &[&str] = &[
+    "qwen3",
+    "qwen3.5",
+    "qwen3.6",
+    "deepseek-r1",
+    "deepseek-v3.1",
+    "deepseek-v3.2",
+    "deepseek-v4",
+    "glm-4.7",
+    "glm-5",
+    "glm-5.1",
+    "minimax-m2.5",
+    "minimax-m2.7",
+    "minimax-m3",
+    "lfm2.5",
+    "nemotron3",
+    "nemotron-3",
+    "kimi-k2.5",
+    "kimi-k2.6",
+    "gemini-3-flash-preview",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThinkingMode {
+    OllamaBool,
+    OllamaLevel(&'static str),
+    PromptToken,
+    Disabled,
+}
+
+struct AgentPromptConfig {
+    preamble: String,
+    params: Value,
+    thinking_mode: ThinkingMode,
+}
 
 #[derive(Debug, Clone)]
 struct Compound {
@@ -81,10 +116,18 @@ impl WeighingAgentApp {
 
     async fn run(&mut self) -> Result<()> {
         let client = ollama::Client::new(self.ollama_base_url.as_str())?;
+        let agent_config = build_agent_prompt_config(&self.model, self.ollama_num_ctx);
+        if agent_config.thinking_mode == ThinkingMode::Disabled {
+            println!(
+                "注意: このモデルでは thinking 出力を有効化しません。Thinking... 表示は出ない場合があります。model: {}",
+                self.model
+            );
+        }
+
         let agent = client
             .agent(&self.model)
-            .preamble(AGENT_PREAMBLE)
-            .additional_params(json!({ "think": true, "num_ctx": self.ollama_num_ctx }))
+            .preamble(&agent_config.preamble)
+            .additional_params(agent_config.params)
             .default_max_turns(8)
             .tool(ValidateFormulaTool)
             .tool(CalculateWeighingTool)
@@ -211,6 +254,46 @@ fn parse_ollama_num_ctx(value: Option<String>) -> Result<u64> {
     }
 
     Ok(parsed)
+}
+
+fn build_agent_prompt_config(model: &str, num_ctx: u64) -> AgentPromptConfig {
+    match thinking_mode_for_model(model) {
+        ThinkingMode::OllamaBool => AgentPromptConfig {
+            preamble: AGENT_PREAMBLE.to_string(),
+            params: json!({ "think": true, "num_ctx": num_ctx }),
+            thinking_mode: ThinkingMode::OllamaBool,
+        },
+        ThinkingMode::OllamaLevel(level) => AgentPromptConfig {
+            preamble: AGENT_PREAMBLE.to_string(),
+            params: json!({ "think": level, "num_ctx": num_ctx }),
+            thinking_mode: ThinkingMode::OllamaLevel(level),
+        },
+        ThinkingMode::PromptToken => AgentPromptConfig {
+            preamble: format!("<|think|>\n{AGENT_PREAMBLE}"),
+            params: json!({ "num_ctx": num_ctx }),
+            thinking_mode: ThinkingMode::PromptToken,
+        },
+        ThinkingMode::Disabled => AgentPromptConfig {
+            preamble: AGENT_PREAMBLE.to_string(),
+            params: json!({ "num_ctx": num_ctx }),
+            thinking_mode: ThinkingMode::Disabled,
+        },
+    }
+}
+
+fn thinking_mode_for_model(model: &str) -> ThinkingMode {
+    let model = model.to_ascii_lowercase();
+    match model.as_str() {
+        m if m.contains("gemma4") || m.contains("gemma-4") => ThinkingMode::PromptToken,
+        m if m.contains("gpt-oss") => ThinkingMode::OllamaLevel("medium"),
+        m if THINK_BOOL_MODEL_MARKERS
+            .iter()
+            .any(|marker| m.contains(marker)) =>
+        {
+            ThinkingMode::OllamaBool
+        }
+        _ => ThinkingMode::Disabled,
+    }
 }
 
 const END_MARKER: &str = "[[END_WORKFLOW]]";
@@ -1614,6 +1697,65 @@ mod tests {
         );
         assert!(parse_ollama_num_ctx(Some("0".to_string())).is_err());
         assert!(parse_ollama_num_ctx(Some("large".to_string())).is_err());
+    }
+
+    #[test]
+    fn detects_model_thinking_modes() {
+        for model in [
+            "qwen3.6:35b",
+            "QWEN3:8b",
+            "deepseek-r1:8b",
+            "deepseek-v3.2:latest",
+            "glm-5.1:latest",
+            "minimax-m3:latest",
+            "kimi-k2.6:latest",
+        ] {
+            assert_eq!(thinking_mode_for_model(model), ThinkingMode::OllamaBool);
+        }
+
+        assert_eq!(
+            thinking_mode_for_model("gpt-oss:20b"),
+            ThinkingMode::OllamaLevel("medium")
+        );
+        assert_eq!(
+            thinking_mode_for_model("gemma4:26b"),
+            ThinkingMode::PromptToken
+        );
+        assert_eq!(
+            thinking_mode_for_model("gemma-4:26b"),
+            ThinkingMode::PromptToken
+        );
+        assert_eq!(
+            thinking_mode_for_model("llama3.2:latest"),
+            ThinkingMode::Disabled
+        );
+    }
+
+    #[test]
+    fn builds_model_specific_agent_prompt_config() {
+        let qwen = build_agent_prompt_config("qwen3.6:35b", 4096);
+        assert_eq!(qwen.thinking_mode, ThinkingMode::OllamaBool);
+        assert_eq!(qwen.params, json!({ "think": true, "num_ctx": 4096 }));
+        assert_eq!(qwen.preamble, AGENT_PREAMBLE);
+
+        let gpt_oss = build_agent_prompt_config("gpt-oss:20b", 4096);
+        assert_eq!(gpt_oss.thinking_mode, ThinkingMode::OllamaLevel("medium"));
+        assert_eq!(
+            gpt_oss.params,
+            json!({ "think": "medium", "num_ctx": 4096 })
+        );
+        assert_eq!(gpt_oss.preamble, AGENT_PREAMBLE);
+
+        let gemma = build_agent_prompt_config("gemma-4:26b", 4096);
+        assert_eq!(gemma.thinking_mode, ThinkingMode::PromptToken);
+        assert_eq!(gemma.params, json!({ "num_ctx": 4096 }));
+        assert!(gemma.preamble.starts_with("<|think|>\n"));
+        assert!(gemma.preamble.ends_with(AGENT_PREAMBLE));
+
+        let disabled = build_agent_prompt_config("llama3.2:latest", 4096);
+        assert_eq!(disabled.thinking_mode, ThinkingMode::Disabled);
+        assert_eq!(disabled.params, json!({ "num_ctx": 4096 }));
+        assert_eq!(disabled.preamble, AGENT_PREAMBLE);
     }
 
     #[test]

@@ -12,6 +12,7 @@
 - 反応式は必ず表示
 - 揮発を含む場合は、反応式を表示してユーザー確認後に秤量値を表示
 - Streaming 応答、thinking token 非表示、thinking 中は `Thinking...` を表示
+- 対応モデルでは Ollama thinking を有効化し、非対応モデルでは起動時に注意を表示
 - 左右移動、Backspace/Delete、日本語入力、上下履歴つき CLI 入力
 - 結果は Markdown 強調なしのプレーンテキストで表示
 
@@ -38,6 +39,8 @@ cargo run
 ```bash
 OLLAMA_BASE_URL=http://localhost:11434 OLLAMA_MODEL=qwen3.6:35b OLLAMA_NUM_CTX=9068 cargo run
 ```
+
+thinking は `qwen3`, `deepseek-r1`, `deepseek-v3.1`, `gpt-oss` などの対応モデルでは自動で有効化します。Gemma 4 系は Ollama の `think` API ではなく prompt token で有効化します。
 
 CLI の終了と画面操作:
 

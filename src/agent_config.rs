@@ -34,6 +34,12 @@ pub(crate) enum ThinkingMode {
     Disabled,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ThinkingSetting {
+    Auto,
+    Off,
+}
+
 pub(crate) struct AgentPromptConfig {
     pub(crate) preamble: String,
     pub(crate) params: Value,
@@ -55,8 +61,31 @@ pub(crate) fn parse_ollama_num_ctx(value: Option<String>) -> Result<u64> {
     Ok(parsed)
 }
 
-pub(crate) fn build_agent_prompt_config(model: &str, num_ctx: u64) -> AgentPromptConfig {
-    match thinking_mode_for_model(model) {
+pub(crate) fn parse_weigh_calc_thinking(value: Option<String>) -> Result<ThinkingSetting> {
+    let Some(value) = value else {
+        return Ok(ThinkingSetting::Auto);
+    };
+
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "auto" => Ok(ThinkingSetting::Auto),
+        "off" | "false" | "0" | "no" => Ok(ThinkingSetting::Off),
+        value => bail!(
+            "WEIGH_CALC_THINKING must be auto or off, got: {value}. Accepted off values: off, false, 0, no"
+        ),
+    }
+}
+
+pub(crate) fn build_agent_prompt_config(
+    model: &str,
+    num_ctx: u64,
+    thinking_setting: ThinkingSetting,
+) -> AgentPromptConfig {
+    let thinking_mode = match thinking_setting {
+        ThinkingSetting::Auto => thinking_mode_for_model(model),
+        ThinkingSetting::Off => ThinkingMode::Disabled,
+    };
+
+    match thinking_mode {
         ThinkingMode::OllamaBool => AgentPromptConfig {
             preamble: AGENT_PREAMBLE.to_string(),
             params: json!({ "think": true, "num_ctx": num_ctx }),

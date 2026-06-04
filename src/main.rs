@@ -16,7 +16,10 @@ mod tools;
 
 #[cfg(test)]
 use agent_config::{DEFAULT_OLLAMA_NUM_CTX, thinking_mode_for_model};
-use agent_config::{ThinkingMode, build_agent_prompt_config, parse_ollama_num_ctx};
+use agent_config::{
+    ThinkingMode, ThinkingSetting, build_agent_prompt_config, parse_ollama_num_ctx,
+    parse_weigh_calc_thinking,
+};
 #[cfg(test)]
 use chemistry::{
     CalculationError, calculate_weighing, calculate_weighing_with_optional_volatiles,
@@ -43,6 +46,7 @@ struct WeighingAgentApp {
     ollama_base_url: String,
     model: String,
     ollama_num_ctx: u64,
+    thinking_setting: ThinkingSetting,
     line_editor: DefaultEditor,
     state: ConversationState,
     last_suggested_formulas: Vec<String>,
@@ -59,6 +63,7 @@ impl WeighingAgentApp {
                 .unwrap_or_else(|_| "http://localhost:11434".to_string()),
             model: std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| "qwen3.6:35b".to_string()),
             ollama_num_ctx: parse_ollama_num_ctx(std::env::var("OLLAMA_NUM_CTX").ok())?,
+            thinking_setting: parse_weigh_calc_thinking(std::env::var("WEIGH_CALC_THINKING").ok())?,
             line_editor: DefaultEditor::new()?,
             state: ConversationState::default(),
             last_suggested_formulas: Vec::new(),
@@ -71,8 +76,14 @@ impl WeighingAgentApp {
 
     async fn run(&mut self) -> Result<()> {
         let client = ollama::Client::new(self.ollama_base_url.as_str())?;
-        let agent_config = build_agent_prompt_config(&self.model, self.ollama_num_ctx);
-        if agent_config.thinking_mode == ThinkingMode::Disabled {
+        let agent_config =
+            build_agent_prompt_config(&self.model, self.ollama_num_ctx, self.thinking_setting);
+        if self.thinking_setting == ThinkingSetting::Off {
+            println!(
+                "注意: WEIGH_CALC_THINKING=off のため thinking を無効化します。Thinking... 表示は出ません。model: {}",
+                self.model
+            );
+        } else if agent_config.thinking_mode == ThinkingMode::Disabled {
             println!(
                 "注意: このモデルでは thinking 出力を有効化しません。Thinking... 表示は出ない場合があります。model: {}",
                 self.model
@@ -379,6 +390,27 @@ mod tests {
     }
 
     #[test]
+    fn parses_thinking_setting() {
+        assert_eq!(
+            parse_weigh_calc_thinking(None).unwrap(),
+            ThinkingSetting::Auto
+        );
+        assert_eq!(
+            parse_weigh_calc_thinking(Some(" auto ".to_string())).unwrap(),
+            ThinkingSetting::Auto
+        );
+
+        for value in ["off", "false", "0", "no", " OFF "] {
+            assert_eq!(
+                parse_weigh_calc_thinking(Some(value.to_string())).unwrap(),
+                ThinkingSetting::Off
+            );
+        }
+
+        assert!(parse_weigh_calc_thinking(Some("low".to_string())).is_err());
+    }
+
+    #[test]
     fn detects_model_thinking_modes() {
         for model in [
             "qwen3.6:35b",
@@ -412,12 +444,12 @@ mod tests {
 
     #[test]
     fn builds_model_specific_agent_prompt_config() {
-        let qwen = build_agent_prompt_config("qwen3.6:35b", 4096);
+        let qwen = build_agent_prompt_config("qwen3.6:35b", 4096, ThinkingSetting::Auto);
         assert_eq!(qwen.thinking_mode, ThinkingMode::OllamaBool);
         assert_eq!(qwen.params, json!({ "think": true, "num_ctx": 4096 }));
         assert_eq!(qwen.preamble, AGENT_PREAMBLE);
 
-        let gpt_oss = build_agent_prompt_config("gpt-oss:20b", 4096);
+        let gpt_oss = build_agent_prompt_config("gpt-oss:20b", 4096, ThinkingSetting::Auto);
         assert_eq!(gpt_oss.thinking_mode, ThinkingMode::OllamaLevel("medium"));
         assert_eq!(
             gpt_oss.params,
@@ -425,16 +457,29 @@ mod tests {
         );
         assert_eq!(gpt_oss.preamble, AGENT_PREAMBLE);
 
-        let gemma = build_agent_prompt_config("gemma-4:26b", 4096);
+        let gemma = build_agent_prompt_config("gemma-4:26b", 4096, ThinkingSetting::Auto);
         assert_eq!(gemma.thinking_mode, ThinkingMode::PromptToken);
         assert_eq!(gemma.params, json!({ "num_ctx": 4096 }));
         assert!(gemma.preamble.starts_with("<|think|>\n"));
         assert!(gemma.preamble.ends_with(AGENT_PREAMBLE));
 
-        let disabled = build_agent_prompt_config("llama3.2:latest", 4096);
+        let disabled = build_agent_prompt_config("llama3.2:latest", 4096, ThinkingSetting::Auto);
         assert_eq!(disabled.thinking_mode, ThinkingMode::Disabled);
         assert_eq!(disabled.params, json!({ "num_ctx": 4096 }));
         assert_eq!(disabled.preamble, AGENT_PREAMBLE);
+    }
+
+    #[test]
+    fn builds_thinking_off_agent_prompt_config() {
+        for model in ["qwen3.6:35b", "gpt-oss:20b", "gemma-4:26b"] {
+            let config = build_agent_prompt_config(model, 4096, ThinkingSetting::Off);
+
+            assert_eq!(config.thinking_mode, ThinkingMode::Disabled);
+            assert_eq!(config.params, json!({ "num_ctx": 4096 }));
+            assert_eq!(config.preamble, AGENT_PREAMBLE);
+            assert!(config.params.get("think").is_none());
+            assert!(!config.preamble.starts_with("<|think|>"));
+        }
     }
 
     #[test]
@@ -518,6 +563,7 @@ mod tests {
             ollama_base_url: "http://localhost:11434".to_string(),
             model: "qwen3.6:35b".to_string(),
             ollama_num_ctx: DEFAULT_OLLAMA_NUM_CTX,
+            thinking_setting: ThinkingSetting::Auto,
             line_editor: DefaultEditor::new().unwrap(),
             state: ConversationState {
                 target_formula: Some("LaTaO3".to_string()),

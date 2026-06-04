@@ -19,6 +19,7 @@
 - 前回計算要約と計算履歴を LLM に渡し、質量変更や条件違いの再計算を支援
 - CLI が表示する秤量結果も stream 風に段階表示
 - 対応モデルでは Ollama thinking を有効化し、非対応モデルでは起動時に注意を表示
+- `WEIGH_CALC_THINKING=off` で thinking を無効化
 - 左右移動、Backspace/Delete、日本語入力、上下履歴つき CLI 入力
 - 結果は Markdown 強調なしのプレーンテキストで表示
 
@@ -41,13 +42,14 @@ cargo run
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | 接続先の Ollama URL |
 | `OLLAMA_MODEL` | `qwen3.6:35b` | 使用する Ollama model |
 | `OLLAMA_NUM_CTX` | `128000` | Ollama に渡す context size (`num_ctx`) |
+| `WEIGH_CALC_THINKING` | `auto` | `auto` で対応モデルの thinking を自動有効化。`off`, `false`, `0`, `no` で thinking を無効化する |
 | `WEIGH_CALC_DEBUG_THINKING` | 未設定 | `1`, `true`, `yes`, `on` の場合、reasoning を `Thinking... (N chars)` ではなく debug 表示する |
 
 ```bash
 OLLAMA_BASE_URL=http://localhost:11434 OLLAMA_MODEL=qwen3.6:35b OLLAMA_NUM_CTX=128000 cargo run
 ```
 
-thinking は `qwen3`, `deepseek-r1`, `deepseek-v3.1`, `gpt-oss` などの対応モデルでは自動で有効化します。Gemma 4 系は Ollama の `think` API ではなく prompt token で有効化します。thinking の長さはアプリ側では制限していません。通常は `Thinking... (N chars)` で受信した reasoning 文字数だけを表示します。debug 時は `WEIGH_CALC_DEBUG_THINKING=1` を指定すると reasoning の内容を表示します。応答全体は 120 秒、chunk 停止は 30 秒で中断します。
+thinking は `qwen3`, `deepseek-r1`, `deepseek-v3.1`, `gpt-oss` などの対応モデルでは自動で有効化します。Gemma 4 系は Ollama の `think` API ではなく prompt token で有効化します。`WEIGH_CALC_THINKING=off` を指定すると、対応モデルでも `think` パラメータや prompt token を使わず thinking を無効化します。thinking の長さはアプリ側では制限していません。通常は `Thinking... (N chars)` で受信した reasoning 文字数だけを表示します。debug 時は `WEIGH_CALC_DEBUG_THINKING=1` を指定すると reasoning の内容を表示します。応答全体は 120 秒、chunk 停止は 30 秒で中断します。
 
 CLI の終了と画面操作:
 

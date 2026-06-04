@@ -30,7 +30,7 @@ use conversation::{
 use prompt::AGENT_PREAMBLE;
 #[cfg(test)]
 use serde_json::json;
-use streaming_ui::print_streaming_agent_response;
+use streaming_ui::{AgentStreamPrintResult, print_streaming_agent_response};
 use tools::{CalculateWeighingTool, ValidateFormulaTool};
 
 #[tokio::main]
@@ -84,12 +84,13 @@ impl WeighingAgentApp {
         let stream = agent
             .stream_chat("ワークフローを開始してください。", chat_history.clone())
             .await;
-        let (_, updated_history, response_text) = print_streaming_agent_response(stream).await?;
-        self.update_last_suggestions(&response_text);
-        if let Some(updated_history) = updated_history {
+        let stream_result = print_streaming_agent_response(stream).await?;
+        self.update_last_suggestions(&stream_result.response_text);
+        if let Some(updated_history) = stream_result.updated_history {
             chat_history = updated_history;
         }
 
+        let mut awaiting_recalculate_answer = false;
         loop {
             let Some(input) = self.read_line("> ")? else {
                 break;
@@ -104,14 +105,35 @@ impl WeighingAgentApp {
                 break;
             }
 
+            if awaiting_recalculate_answer {
+                match classify_recalculate_answer(&input) {
+                    RecalculateAnswer::Restart => {
+                        self.reset_calculation_state();
+                        chat_history.clear();
+                        awaiting_recalculate_answer = false;
+                        println!("作りたい組成（化学式）と、何g欲しいか教えてください。");
+                        continue;
+                    }
+                    RecalculateAnswer::End => break,
+                    RecalculateAnswer::NewRequest => {
+                        self.reset_calculation_state();
+                        chat_history.clear();
+                        awaiting_recalculate_answer = false;
+                    }
+                }
+            }
+
             self.update_state_from_user_input(&input);
             let prompt = self.state.wrap_user_input(&input);
             let stream = agent.stream_chat(prompt, chat_history.clone()).await;
-            let (should_end, updated_history, response_text) =
-                print_streaming_agent_response(stream).await?;
-            self.update_last_suggestions(&response_text);
-            if let Some(updated_history) = updated_history {
-                chat_history = updated_history;
+            let stream_result = print_streaming_agent_response(stream).await?;
+            let should_end = self.apply_stream_result(
+                stream_result,
+                &mut chat_history,
+                &mut awaiting_recalculate_answer,
+            );
+            if awaiting_recalculate_answer {
+                continue;
             }
             if should_end {
                 break;
@@ -184,6 +206,51 @@ impl WeighingAgentApp {
         if formulas.len() >= 2 {
             self.last_suggested_formulas = formulas;
         }
+    }
+
+    fn reset_calculation_state(&mut self) {
+        self.state = ConversationState::default();
+        self.last_suggested_formulas.clear();
+    }
+
+    fn apply_stream_result(
+        &mut self,
+        stream_result: AgentStreamPrintResult,
+        chat_history: &mut Vec<Message>,
+        awaiting_recalculate_answer: &mut bool,
+    ) -> bool {
+        let should_end = stream_result.should_end;
+        self.update_last_suggestions(&stream_result.response_text);
+        if let Some(updated_history) = stream_result.updated_history {
+            *chat_history = updated_history;
+        }
+        if stream_result.printed_deterministic_result {
+            *awaiting_recalculate_answer = true;
+        }
+        should_end
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecalculateAnswer {
+    Restart,
+    End,
+    NewRequest,
+}
+
+fn classify_recalculate_answer(input: &str) -> RecalculateAnswer {
+    let normalized = input
+        .trim()
+        .trim_matches(|ch: char| {
+            ch.is_ascii_punctuation() || matches!(ch, '。' | '、' | '？' | '！')
+        })
+        .to_ascii_lowercase();
+    match normalized.as_str() {
+        "はい" | "yes" | "y" | "ok" | "再計算" | "もう一度" | "もう1回" | "続ける" => {
+            RecalculateAnswer::Restart
+        }
+        "いいえ" | "no" | "n" | "終了" | "終わり" | "やめる" => RecalculateAnswer::End,
+        _ => RecalculateAnswer::NewRequest,
     }
 }
 
@@ -268,6 +335,23 @@ mod tests {
         assert_eq!(disabled.thinking_mode, ThinkingMode::Disabled);
         assert_eq!(disabled.params, json!({ "num_ctx": 4096 }));
         assert_eq!(disabled.preamble, AGENT_PREAMBLE);
+    }
+
+    #[test]
+    fn classifies_recalculate_answers() {
+        for input in ["はい", "yes", "Y", "ok", "再計算", "もう一度", "続ける"] {
+            assert_eq!(
+                classify_recalculate_answer(input),
+                RecalculateAnswer::Restart
+            );
+        }
+        for input in ["いいえ", "no", "N", "終了", "終わり", "やめる"] {
+            assert_eq!(classify_recalculate_answer(input), RecalculateAnswer::End);
+        }
+        assert_eq!(
+            classify_recalculate_answer("LiCoO2 3g"),
+            RecalculateAnswer::NewRequest
+        );
     }
 
     #[test]

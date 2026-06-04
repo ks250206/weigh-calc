@@ -14,9 +14,16 @@ use crate::prompt::END_MARKER;
 const STREAM_CHUNK_TIMEOUT_SECS: u64 = 90;
 const STREAM_TOTAL_TIMEOUT_SECS: u64 = 240;
 
+pub(crate) struct AgentStreamPrintResult {
+    pub(crate) should_end: bool,
+    pub(crate) updated_history: Option<Vec<Message>>,
+    pub(crate) response_text: String,
+    pub(crate) printed_deterministic_result: bool,
+}
+
 pub(crate) async fn print_streaming_agent_response<R>(
     mut stream: StreamingResult<R>,
-) -> Result<(bool, Option<Vec<Message>>, String)>
+) -> Result<AgentStreamPrintResult>
 where
     R: Clone + Unpin,
 {
@@ -29,7 +36,6 @@ where
     let mut thinking_char_count = 0usize;
     let mut suppress_duplicate_reaction_line = false;
     let mut duplicate_reaction_line_buffer = String::new();
-    let mut suppress_assistant_after_deterministic_result = false;
     let mut updated_history = None;
     let started_at = Instant::now();
 
@@ -39,7 +45,12 @@ where
             println!(
                 "応答が長時間完了しなかったため中断しました。もう一度、化学式のリストを具体的に入力してください。"
             );
-            return Ok((false, updated_history, response_text));
+            return Ok(AgentStreamPrintResult {
+                should_end: false,
+                updated_history,
+                response_text,
+                printed_deterministic_result: false,
+            });
         }
 
         let Some(chunk) = (match timeout(
@@ -54,7 +65,12 @@ where
                 println!(
                     "応答が停止したため中断しました。もう一度、化学式のリストを具体的に入力してください。"
                 );
-                return Ok((false, updated_history, response_text));
+                return Ok(AgentStreamPrintResult {
+                    should_end: false,
+                    updated_history,
+                    response_text,
+                    printed_deterministic_result: false,
+                });
             }
         }) else {
             break;
@@ -65,9 +81,6 @@ where
             MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(text)) => {
                 clear_thinking_indicator(&mut showing_thinking)?;
                 response_text.push_str(&text.text);
-                if suppress_assistant_after_deterministic_result {
-                    continue;
-                }
                 let sanitized = sanitize_assistant_text(&text.text);
                 let filtered = filter_duplicate_reaction_line(
                     &sanitized,
@@ -117,8 +130,15 @@ where
                     &mut printed_reaction_equations,
                 )?;
                 printed_visible_text |= tool_print_result.printed;
-                suppress_assistant_after_deterministic_result |=
-                    tool_print_result.printed_deterministic_result;
+                if tool_print_result.printed_deterministic_result {
+                    clear_thinking_indicator(&mut showing_thinking)?;
+                    return Ok(AgentStreamPrintResult {
+                        should_end: false,
+                        updated_history,
+                        response_text,
+                        printed_deterministic_result: true,
+                    });
+                }
             }
             MultiTurnStreamItem::FinalResponse(response) => {
                 clear_thinking_indicator(&mut showing_thinking)?;
@@ -140,7 +160,12 @@ where
     } else if printed_visible_text {
         println!();
     }
-    Ok((should_end, updated_history, response_text))
+    Ok(AgentStreamPrintResult {
+        should_end,
+        updated_history,
+        response_text,
+        printed_deterministic_result: false,
+    })
 }
 
 fn sanitize_assistant_text(text: &str) -> String {

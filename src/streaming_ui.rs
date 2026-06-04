@@ -7,12 +7,14 @@ use rig::streaming::{StreamedAssistantContent, StreamedUserContent};
 use serde::Deserialize;
 use std::collections::BTreeSet;
 use std::io::{self, Write};
-use tokio::time::{Duration, Instant, timeout};
+use tokio::time::{Duration, Instant, sleep, timeout};
 
 use crate::prompt::END_MARKER;
 
 const STREAM_CHUNK_TIMEOUT_SECS: u64 = 90;
 const STREAM_TOTAL_TIMEOUT_SECS: u64 = 240;
+const DETERMINISTIC_OUTPUT_CHUNK_CHARS: usize = 4;
+const DETERMINISTIC_OUTPUT_CHUNK_DELAY_MS: u64 = 8;
 
 pub(crate) struct AgentStreamPrintResult {
     pub(crate) should_end: bool,
@@ -128,7 +130,8 @@ where
                 let tool_print_result = print_calculation_from_tool_result(
                     &tool_result,
                     &mut printed_reaction_equations,
-                )?;
+                )
+                .await?;
                 printed_visible_text |= tool_print_result.printed;
                 if tool_print_result.printed_deterministic_result {
                     clear_thinking_indicator(&mut showing_thinking)?;
@@ -278,7 +281,7 @@ struct CalculationItem {
     grams: f64,
 }
 
-fn print_calculation_from_tool_result(
+async fn print_calculation_from_tool_result(
     tool_result: &ToolResult,
     printed_reaction_equations: &mut BTreeSet<String>,
 ) -> Result<ToolPrintResult> {
@@ -315,11 +318,7 @@ fn print_calculation_from_tool_result(
             return Ok(ToolPrintResult::default());
         }
 
-        print!(
-            "{}",
-            format_deterministic_calculation_result(equation, &value)
-        );
-        io::stdout().flush()?;
+        stream_text(&format_deterministic_calculation_result(equation, &value)).await?;
         return Ok(ToolPrintResult {
             printed: true,
             printed_deterministic_result: true,
@@ -327,6 +326,29 @@ fn print_calculation_from_tool_result(
     }
 
     Ok(ToolPrintResult::default())
+}
+
+async fn stream_text(text: &str) -> Result<()> {
+    let mut chunk = String::new();
+    let mut chunk_chars = 0usize;
+
+    for ch in text.chars() {
+        chunk.push(ch);
+        chunk_chars += 1;
+        if chunk_chars >= DETERMINISTIC_OUTPUT_CHUNK_CHARS || ch == '\n' {
+            print!("{chunk}");
+            io::stdout().flush()?;
+            chunk.clear();
+            chunk_chars = 0;
+            sleep(Duration::from_millis(DETERMINISTIC_OUTPUT_CHUNK_DELAY_MS)).await;
+        }
+    }
+
+    if !chunk.is_empty() {
+        print!("{chunk}");
+        io::stdout().flush()?;
+    }
+    Ok(())
 }
 
 fn format_deterministic_calculation_result(

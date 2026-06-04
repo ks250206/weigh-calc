@@ -3,7 +3,7 @@ use serde_json::{Value, json};
 
 use crate::prompt::AGENT_PREAMBLE;
 
-pub(crate) const DEFAULT_OLLAMA_NUM_CTX: u64 = 9068;
+pub(crate) const DEFAULT_OLLAMA_NUM_CTX: u64 = 128000;
 const THINK_BOOL_MODEL_MARKERS: &[&str] = &[
     "qwen3",
     "qwen3.5",

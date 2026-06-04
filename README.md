@@ -34,10 +34,10 @@ cargo run
 | --- | --- | --- |
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | 接続先の Ollama URL |
 | `OLLAMA_MODEL` | `qwen3.6:35b` | 使用する Ollama model |
-| `OLLAMA_NUM_CTX` | `9068` | Ollama に渡す context size (`num_ctx`) |
+| `OLLAMA_NUM_CTX` | `128000` | Ollama に渡す context size (`num_ctx`) |
 
 ```bash
-OLLAMA_BASE_URL=http://localhost:11434 OLLAMA_MODEL=qwen3.6:35b OLLAMA_NUM_CTX=9068 cargo run
+OLLAMA_BASE_URL=http://localhost:11434 OLLAMA_MODEL=qwen3.6:35b OLLAMA_NUM_CTX=128000 cargo run
 ```
 
 thinking は `qwen3`, `deepseek-r1`, `deepseek-v3.1`, `gpt-oss` などの対応モデルでは自動で有効化します。Gemma 4 系は Ollama の `think` API ではなく prompt token で有効化します。
